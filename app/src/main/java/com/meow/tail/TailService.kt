@@ -57,6 +57,9 @@ class TailService : AccessibilityService() {
         private val logLines = ArrayDeque<String>()
         private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
+        private var lastLogKey = ""
+        private var lastLogAt = 0L
+
         private var eventCount = 0
         private var writeAttempts = 0
         private var writeOk = 0
@@ -80,6 +83,10 @@ class TailService : AccessibilityService() {
 
         @Synchronized
         fun addLog(line: String) {
+            val now = System.currentTimeMillis()
+            if (line == lastLogKey && now - lastLogAt < 5000) return
+            lastLogKey = line
+            lastLogAt = now
             val stamp = timeFormat.format(Date())
             logLines.addFirst("$stamp  $line")
             while (logLines.size > MAX_LOG) {
@@ -230,9 +237,11 @@ class TailService : AccessibilityService() {
             textOverride
         }
         if (text.isNullOrEmpty()) {
-            addLog("跳过：文本为空 [${className(node)}]")
+            addLog("跳过：文本为空 [${className(node)}] id=${viewId(node)}")
             return
         }
+
+        addLog("候选 [$pkg] ${className(node)} id=${viewId(node)} «${tail(text)}»")
 
         val previous = lastSeen[pkg]
         lastSeen[pkg] = text
@@ -422,6 +431,8 @@ class TailService : AccessibilityService() {
             // 忽略
         }
 
+        addLog("窗口数 ${roots.size}")
+
         var allowedFocused: AccessibilityNodeInfo? = null
         var allowed: AccessibilityNodeInfo? = null
         var samePackage: AccessibilityNodeInfo? = null
@@ -481,6 +492,13 @@ class TailService : AccessibilityService() {
             .filter { it.isNotEmpty() }
             .any { it == pkg }
     }
+
+    private fun viewId(node: AccessibilityNodeInfo?): String =
+        try {
+            node?.viewIdResourceName ?: "-"
+        } catch (t: Throwable) {
+            "?"
+        }
 
     private fun className(node: AccessibilityNodeInfo?): String =
         try {
