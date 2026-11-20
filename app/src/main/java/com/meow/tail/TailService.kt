@@ -14,28 +14,16 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * v1.5
+ * v1.6
  *
- * 针对百度输入法等「事件源不是可编辑框」的情况：
- * - 事件源向上找可编辑祖先，找不到再按「焦点 + 可编辑」全树搜索
- * - 缓存最近一次拿到的可编辑节点，归位路径优先复用它（findFocus 在部分 App 返回 null）
- * - 所有回调包 try/catch，节点失效不再中断整条链路
- * - 每次跳过都写明原因，方便定位
- *
- * v1.4
- *
- * 修复 v1.3 及以前的致命逻辑 bug：原先在判断之前就写入 lastText，
- * 导致「事件先到、归位后到」时归位路径认为文本没变化而直接返回，
- * 结果除标点瞬间外永远不会补字。
- *
- * 现在的状态模型：
- * - lastSeen[pkg] 记录「上次看到的文本」，只用于判断用户是否还在输入
- * - 事件路径：文本变化 + 末字符是标点 → 立即补
- * - 归位路径（停顿 650ms）：无条件整理成「内容 + 后缀 + 末尾标点」
- * - 轮询路径：只有连续两次读到同样文本（稳定 400ms）才动手，
- *   避免在拼音组合态里插字
- *
- * 写回失败时回退到「全选 + 剪贴板粘贴」。
+ * 针对荣耀 + 百度输入法：
+ * 1. 输入法弹出时「当前活动窗口」可能变成输入法窗口，findFocus / rootInActiveWindow
+ *    会指向错误的地方。现在会遍历 windows（需要 flagRetrieveInteractiveWindows），
+ *    跨窗口寻找输入框。
+ * 2. 不再死要求 isEditable：微信/百度会把编辑框的 isEditable 报成 false。
+ *    判定条件放宽为「是 EditText 类名 / 可编辑 / 有焦点且带文本」，三者任一。
+ * 3. 事件没有文本时，退回使用 event.getText()。
+ * 4. 日志里会打印事件源的类名，方便判断微信到底给的是什么控件。
  */
 class TailService : AccessibilityService() {
 
@@ -116,7 +104,7 @@ class TailService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val lastSeen = HashMap<String, String>()
-    private var cachedEditable: AccessibilityNodeInfo? = null
+    private var cachedCandidate: AccessibilityNodeInfo? = null
     private var lastChangeAt = 0L
     private var lastSelfWriteAt = 0L
     private var polling = false
@@ -150,116 +138,69 @@ class TailService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        val type = event.eventType
-        if (type != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED &&
-            type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-        ) {
-            return
-        }
-        if (System.currentTimeMillis() - lastSelfWriteAt < SELF_WRITE_WINDOW_MS) return
-
-        val pkg = event.packageName?.toString() ?: return
-        if (pkg == packageName) return
-        if (!isAllowed(pkg)) return
-
-        lastChangeAt = System.currentTimeMillis()
-        countEvent()
-        addLog("事件 ${typeName(type)} $pkg")
-
-        if (type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
-            try {
-                val node = resolveEditable(event.source) ?: findEditableInTree()
-                if (node != null) {
-                    cachedEditable = node
-                    handle(node, pkg, "事件", Mode.EVENT)
-                } else {
-                    addLog("跳过：没找到可编辑框 $pkg")
-                }
-            } catch (t: Throwable) {
-                addLog("事件处理异常 ${t.javaClass.simpleName}")
+        try {
+            val type = event.eventType
+            if (type != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED &&
+                type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            ) {
+                return
             }
+            if (System.currentTimeMillis() - lastSelfWriteAt < SELF_WRITE_WINDOW_MS) return
+
+            val pkg = event.packageName?.toString() ?: return
+            if (pkg == packageName) return
+            if (!isAllowed(pkg)) return
+
+            lastChangeAt = System.currentTimeMillis()
+            countEvent()
+
+            val source = event.source
+            addLog("事件 ${typeName(type)} $pkg [${className(source)}]")
+
+            if (type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+                val node = resolveCandidate(source) ?: findCandidateInAnyWindow()
+                if (node != null) {
+                    cachedCandidate = node
+                    val fromEvent = event.text?.joinToString("")?.takeIf { it.isNotEmpty() }
+                    handle(node, pkg, "事件", Mode.EVENT, fromEvent)
+                } else {
+                    addLog("跳过：没找到输入框 $pkg")
+                }
+            }
+            scheduleSettle()
+        } catch (t: Throwable) {
+            addLog("事件异常 ${t.javaClass.simpleName}")
         }
-        scheduleSettle()
     }
 
     private fun checkFocused(source: String, mode: Mode) {
         if (System.currentTimeMillis() - lastSelfWriteAt < SELF_WRITE_WINDOW_MS) return
         try {
-            val cached = cachedEditable
-            val node = if (cached != null && safeIsEditable(cached)) {
-                cached
-            } else {
-                focusedNode() ?: findEditableInTree()
+            val cached = cachedCandidate
+            val node = when {
+                cached != null && safeIsCandidate(cached) -> cached
+                else -> focusedNode() ?: findCandidateInAnyWindow()
             }
             if (node == null) {
-                addLog("跳过：归位时没有可编辑框")
+                addLog("跳过：$source 没找到输入框")
                 return
             }
-            cachedEditable = node
+            cachedCandidate = node
             val pkg = node.packageName?.toString() ?: return
             if (!isAllowed(pkg)) return
-            handle(node, pkg, source, mode)
+            handle(node, pkg, source, mode, null)
         } catch (t: Throwable) {
-            addLog("归位异常 ${t.javaClass.simpleName}")
+            addLog("$source 异常 ${t.javaClass.simpleName}")
         }
     }
 
-    private fun focusedNode(): AccessibilityNodeInfo? =
-        try {
-            rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        } catch (t: Throwable) {
-            null
-        }
-
-    private fun safeIsEditable(node: AccessibilityNodeInfo): Boolean =
-        try {
-            node.isEditable && !node.isPassword
-        } catch (t: Throwable) {
-            false
-        }
-
-    /** 事件源不一定是输入框：向上逐级找可编辑祖先。 */
-    private fun resolveEditable(start: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        var node = start
-        var depth = 0
-        while (node != null && depth < 8) {
-            if (safeIsEditable(node)) return node
-            node = try {
-                node.parent
-            } catch (t: Throwable) {
-                null
-            }
-            depth++
-        }
-        return null
-    }
-
-    /** 兜底：在整棵树里找「可编辑且获得焦点」的节点。 */
-    private fun findEditableInTree(): AccessibilityNodeInfo? {
-        val root = try {
-            rootInActiveWindow
-        } catch (t: Throwable) {
-            null
-        } ?: return null
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        var visited = 0
-        while (queue.isNotEmpty() && visited < 400) {
-            visited++
-            val node = queue.removeFirst()
-            try {
-                if (node.isEditable && node.isFocused) return node
-                for (i in 0 until node.childCount) {
-                    node.getChild(i)?.let { queue.add(it) }
-                }
-            } catch (t: Throwable) {
-                // 节点失效，跳过
-            }
-        }
-        return null
-    }
-
-    private fun handle(node: AccessibilityNodeInfo, pkg: String, source: String, mode: Mode) {
+    private fun handle(
+        node: AccessibilityNodeInfo,
+        pkg: String,
+        source: String,
+        mode: Mode,
+        textOverride: String?,
+    ) {
         if (node.isPassword) return
 
         val suffix = prefs().getString(KEY_SUFFIX, DEFAULT_SUFFIX).orEmpty()
@@ -267,25 +208,21 @@ class TailService : AccessibilityService() {
         if (suffix.isEmpty() || triggers.isEmpty()) return
 
         val text = try {
-            node.text?.toString()
+            node.text?.toString()?.takeIf { it.isNotEmpty() } ?: textOverride
         } catch (t: Throwable) {
-            null
+            textOverride
         }
         if (text.isNullOrEmpty()) {
-            addLog("跳过：文本为空")
+            addLog("跳过：文本为空 [${className(node)}]")
             return
         }
 
         val previous = lastSeen[pkg]
         lastSeen[pkg] = text
 
-        // 事件路径：同一文本重复上报，忽略
         if (mode == Mode.EVENT && previous == text) return
-
-        // 轮询路径：等文本稳定一轮再来，避免打断拼音组合
         if (mode == Mode.POLL && previous != text) return
 
-        // 光标明显在句中时不处理（Ime 上报 -1 或末尾都放行）
         val selectionEnd = try {
             node.textSelectionEnd
         } catch (t: Throwable) {
@@ -297,7 +234,6 @@ class TailService : AccessibilityService() {
         }
 
         val always = prefs().getBoolean(KEY_ALWAYS, true)
-        // 事件路径只在「刚敲下句末标点」时动手，其余交给归位
         if (mode == Mode.EVENT && triggers.indexOf(text.last()) < 0) return
 
         val newText = normalize(text, suffix, triggers, always)
@@ -313,13 +249,10 @@ class TailService : AccessibilityService() {
             addLog("补字成功 [$source] $pkg «${tail(newText)}»")
         } else {
             countFail()
-            addLog("写入失败 [$source] $pkg")
+            addLog("写入失败 [$source] ${className(node)}")
         }
     }
 
-    /**
-     * 整理成「内容 + 后缀 + 末尾标点」。返回 null 表示不需要改动。
-     */
     private fun normalize(text: String, suffix: String, triggers: String, always: Boolean): String? {
         if (text.isEmpty()) return null
 
@@ -344,7 +277,6 @@ class TailService : AccessibilityService() {
         return if (proposed == text) null else proposed
     }
 
-    /** 先试 ACTION_SET_TEXT，失败则「全选 + 剪贴板粘贴」。 */
     private fun writeText(node: AccessibilityNodeInfo, oldText: String, newText: String): Boolean {
         lastSelfWriteAt = System.currentTimeMillis()
         val args = Bundle().apply {
@@ -358,7 +290,6 @@ class TailService : AccessibilityService() {
             return true
         }
 
-        // 回退：全选 → 粘贴
         val clipboard = getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
         clipboard.setPrimaryClip(ClipData.newPlainText("miao", newText))
         val selectAll = Bundle().apply {
@@ -371,14 +302,105 @@ class TailService : AccessibilityService() {
     }
 
     private fun moveCaret(node: AccessibilityNodeInfo, oldText: String, newText: String) {
-        val selectionEnd = node.textSelectionEnd
+        val selectionEnd = try {
+            node.textSelectionEnd
+        } catch (t: Throwable) {
+            return
+        }
         if (selectionEnd < 0) return
         val target = (selectionEnd + (newText.length - oldText.length)).coerceIn(0, newText.length)
         val selection = Bundle().apply {
             putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, target)
             putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, target)
         }
-        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selection)
+        try {
+            node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selection)
+        } catch (t: Throwable) {
+            // 忽略
+        }
+    }
+
+    private fun focusedNode(): AccessibilityNodeInfo? =
+        try {
+            rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        } catch (t: Throwable) {
+            null
+        }
+
+    /** 判定是不是「可能的输入框」：三个条件任一即可。 */
+    private fun safeIsCandidate(node: AccessibilityNodeInfo): Boolean =
+        try {
+            isCandidate(node)
+        } catch (t: Throwable) {
+            false
+        }
+
+    private fun isCandidate(node: AccessibilityNodeInfo): Boolean {
+        if (node.isPassword) return false
+        val cls = node.className?.toString().orEmpty()
+        if (node.isEditable) return true
+        if (cls.contains("EditText", ignoreCase = true)) return true
+        return node.isFocused && node.text != null
+    }
+
+    /** 事件源向上找输入框祖先。 */
+    private fun resolveCandidate(start: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        var node = start
+        var depth = 0
+        while (node != null && depth < 8) {
+            if (safeIsCandidate(node)) return node
+            node = try {
+                node.parent
+            } catch (t: Throwable) {
+                null
+            }
+            depth++
+        }
+        return null
+    }
+
+    /** 跨窗口搜索：输入法窗口可能抢走「当前活动窗口」。 */
+    private fun findCandidateInAnyWindow(): AccessibilityNodeInfo? {
+        val roots = mutableListOf<AccessibilityNodeInfo>()
+        try {
+            windows.forEach { w ->
+                try {
+                    w.root?.let { roots.add(it) }
+                } catch (t: Throwable) {
+                    // 忽略失效窗口
+                }
+            }
+        } catch (t: Throwable) {
+            // windows 不可用
+        }
+        try {
+            rootInActiveWindow?.let { roots.add(it) }
+        } catch (t: Throwable) {
+            // 忽略
+        }
+
+        var fallback: AccessibilityNodeInfo? = null
+        for (root in roots) {
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+            var visited = 0
+            while (queue.isNotEmpty() && visited < 600) {
+                visited++
+                val node = queue.removeFirst()
+                try {
+                    if (isCandidate(node)) {
+                        if (node.isFocused) return node
+                        if (fallback == null) fallback = node
+                    }
+                    for (i in 0 until node.childCount) {
+                        node.getChild(i)?.let { queue.add(it) }
+                    }
+                } catch (t: Throwable) {
+                    // 节点失效
+                }
+            }
+        }
+        return fallback
     }
 
     private fun isIdle(): Boolean = System.currentTimeMillis() - lastChangeAt >= IDLE_GATE_MS
@@ -401,6 +423,13 @@ class TailService : AccessibilityService() {
             .filter { it.isNotEmpty() }
             .any { it == pkg }
     }
+
+    private fun className(node: AccessibilityNodeInfo?): String =
+        try {
+            node?.className?.toString() ?: "null"
+        } catch (t: Throwable) {
+            "?"
+        }
 
     private fun typeName(type: Int): String = when (type) {
         AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> "TEXT_CHANGED"
