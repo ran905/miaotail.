@@ -1,6 +1,8 @@
 package com.meow.tail
 
 import android.accessibilityservice.AccessibilityService
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.SharedPreferences
 import android.os.Bundle
 import android.os.Handler
@@ -12,15 +14,20 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * v1.2
+ * v1.4
  *
- * 相对 v1.1 的变化：
- * 1. 新增「无条件补喵」模式（默认开启）：不依赖句末标点，任何输入都会带上后缀
- * 2. 归位逻辑：停顿 650ms 后，把后缀移到「最后一个标点之前」或「整句末尾」
- *    - 用户继续打字时，后缀会被移到新内容的后面
- *    - 已经带后缀的句子不会重复插入
- * 3. 只在光标位于末尾时动手，避免打乱句中编辑
- * 4. 保留诊断日志
+ * 修复 v1.3 及以前的致命逻辑 bug：原先在判断之前就写入 lastText，
+ * 导致「事件先到、归位后到」时归位路径认为文本没变化而直接返回，
+ * 结果除标点瞬间外永远不会补字。
+ *
+ * 现在的状态模型：
+ * - lastSeen[pkg] 记录「上次看到的文本」，只用于判断用户是否还在输入
+ * - 事件路径：文本变化 + 末字符是标点 → 立即补
+ * - 归位路径（停顿 650ms）：无条件整理成「内容 + 后缀 + 末尾标点」
+ * - 轮询路径：只有连续两次读到同样文本（稳定 400ms）才动手，
+ *   避免在拼音组合态里插字
+ *
+ * 写回失败时回退到「全选 + 剪贴板粘贴」。
  */
 class TailService : AccessibilityService() {
 
@@ -46,12 +53,25 @@ class TailService : AccessibilityService() {
         private val logLines = ArrayDeque<String>()
         private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
+        private var eventCount = 0
+        private var writeAttempts = 0
+        private var writeOk = 0
+        private var writeFail = 0
+
         @Synchronized
         fun snapshotLog(): List<String> = logLines.toList()
 
         @Synchronized
+        fun stats(): String =
+            "事件 $eventCount · 尝试 $writeAttempts · 成功 $writeOk · 失败 $writeFail"
+
+        @Synchronized
         fun clearLog() {
             logLines.clear()
+            eventCount = 0
+            writeAttempts = 0
+            writeOk = 0
+            writeFail = 0
         }
 
         @Synchronized
@@ -62,10 +82,32 @@ class TailService : AccessibilityService() {
                 logLines.removeLast()
             }
         }
+
+        @Synchronized
+        fun countEvent() {
+            eventCount++
+        }
+
+        @Synchronized
+        fun countAttempt() {
+            writeAttempts++
+        }
+
+        @Synchronized
+        fun countOk() {
+            writeOk++
+        }
+
+        @Synchronized
+        fun countFail() {
+            writeFail++
+        }
     }
 
+    private enum class Mode { EVENT, SETTLE, POLL }
+
     private val handler = Handler(Looper.getMainLooper())
-    private val lastText = HashMap<String, String>()
+    private val lastSeen = HashMap<String, String>()
     private var lastChangeAt = 0L
     private var lastSelfWriteAt = 0L
     private var polling = false
@@ -73,7 +115,7 @@ class TailService : AccessibilityService() {
     private val pollRunnable = object : Runnable {
         override fun run() {
             try {
-                if (isIdle()) checkFocused("轮询")
+                if (isIdle()) checkFocused("轮询", Mode.POLL)
             } catch (t: Throwable) {
                 addLog("轮询异常 ${t.javaClass.simpleName}")
             }
@@ -83,8 +125,7 @@ class TailService : AccessibilityService() {
 
     private val settleRunnable = Runnable {
         try {
-            if (isIdle()) checkFocused("归位")
-            else scheduleSettle()
+            if (isIdle()) checkFocused("归位", Mode.SETTLE) else scheduleSettle()
         } catch (t: Throwable) {
             addLog("归位异常 ${t.javaClass.simpleName}")
         }
@@ -113,29 +154,28 @@ class TailService : AccessibilityService() {
         if (!isAllowed(pkg)) return
 
         lastChangeAt = System.currentTimeMillis()
+        countEvent()
         addLog("事件 ${typeName(type)} $pkg")
 
         if (type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
-            val node = event.source ?: focusedNode() ?: return
-            handle(node, pkg, "事件", immediate = true)
+            val node = event.source ?: focusedNode()
+            if (node != null) handle(node, pkg, "事件", Mode.EVENT)
         }
         scheduleSettle()
     }
 
-    private fun checkFocused(source: String) {
+    private fun checkFocused(source: String, mode: Mode) {
         if (System.currentTimeMillis() - lastSelfWriteAt < SELF_WRITE_WINDOW_MS) return
         val node = focusedNode() ?: return
         val pkg = node.packageName?.toString() ?: return
         if (!isAllowed(pkg)) return
-        handle(node, pkg, source, immediate = false)
+        handle(node, pkg, source, mode)
     }
 
-    private fun focusedNode(): AccessibilityNodeInfo? {
-        val root = rootInActiveWindow ?: return null
-        return root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-    }
+    private fun focusedNode(): AccessibilityNodeInfo? =
+        rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
 
-    private fun handle(node: AccessibilityNodeInfo, pkg: String, source: String, immediate: Boolean) {
+    private fun handle(node: AccessibilityNodeInfo, pkg: String, source: String, mode: Mode) {
         if (node.isPassword) return
 
         val suffix = prefs().getString(KEY_SUFFIX, DEFAULT_SUFFIX).orEmpty()
@@ -145,32 +185,39 @@ class TailService : AccessibilityService() {
         val text = node.text?.toString() ?: return
         if (text.isEmpty()) return
 
-        val previous = lastText[pkg]
-        lastText[pkg] = text
-        if (previous == text) return
+        val previous = lastSeen[pkg]
+        lastSeen[pkg] = text
 
-        // 用户正在句中编辑时不动，避免打乱光标
+        // 事件路径：同一文本重复上报，忽略
+        if (mode == Mode.EVENT && previous == text) return
+
+        // 轮询路径：等文本稳定一轮再来，避免打断拼音组合
+        if (mode == Mode.POLL && previous != text) return
+
+        // 用户正在句中编辑时不动
         val selectionEnd = node.textSelectionEnd
         if (selectionEnd >= 0 && selectionEnd != text.length) return
 
         val always = prefs().getBoolean(KEY_ALWAYS, true)
-        // 立即路径只处理「标点刚敲下」，其余交给停顿后的归位
-        if (immediate && triggers.indexOf(text.last()) < 0) return
+        // 事件路径只在「刚敲下句末标点」时动手，其余交给归位
+        if (mode == Mode.EVENT && triggers.indexOf(text.last()) < 0) return
 
         val newText = normalize(text, suffix, triggers, always) ?: return
-        if (previous == newText) return
+        if (newText == text) return
 
+        countAttempt()
         if (writeText(node, text, newText)) {
-            lastText[pkg] = newText
+            lastSeen[pkg] = newText
+            countOk()
             addLog("补字成功 [$source] $pkg «${tail(newText)}»")
         } else {
+            countFail()
             addLog("写入失败 [$source] $pkg")
         }
     }
 
     /**
-     * 把文本整理成「内容 + 后缀 + 末尾标点」。
-     * 返回 null 表示不需要改动。
+     * 整理成「内容 + 后缀 + 末尾标点」。返回 null 表示不需要改动。
      */
     private fun normalize(text: String, suffix: String, triggers: String, always: Boolean): String? {
         if (text.isEmpty()) return null
@@ -186,7 +233,6 @@ class TailService : AccessibilityService() {
         var core = text.substring(0, end)
         if (!always && punctuation == null) return null
 
-        // 去掉已经存在的后缀（最后一次出现），无论它被挤到哪
         val index = core.lastIndexOf(suffix)
         if (index >= 0) {
             core = core.removeRange(index, index + suffix.length)
@@ -197,6 +243,7 @@ class TailService : AccessibilityService() {
         return if (proposed == text) null else proposed
     }
 
+    /** 先试 ACTION_SET_TEXT，失败则「全选 + 剪贴板粘贴」。 */
     private fun writeText(node: AccessibilityNodeInfo, oldText: String, newText: String): Boolean {
         lastSelfWriteAt = System.currentTimeMillis()
         val args = Bundle().apply {
@@ -205,18 +252,32 @@ class TailService : AccessibilityService() {
                 newText,
             )
         }
-        if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return false
-
-        val selectionEnd = node.textSelectionEnd
-        if (selectionEnd >= 0) {
-            val target = selectionEnd + (newText.length - oldText.length)
-            val selection = Bundle().apply {
-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, target)
-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, target)
-            }
-            node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selection)
+        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+            moveCaret(node, oldText, newText)
+            return true
         }
+
+        // 回退：全选 → 粘贴
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
+        clipboard.setPrimaryClip(ClipData.newPlainText("miao", newText))
+        val selectAll = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, oldText.length)
+        }
+        if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectAll)) return false
+        if (!node.performAction(AccessibilityNodeInfo.ACTION_PASTE)) return false
         return true
+    }
+
+    private fun moveCaret(node: AccessibilityNodeInfo, oldText: String, newText: String) {
+        val selectionEnd = node.textSelectionEnd
+        if (selectionEnd < 0) return
+        val target = (selectionEnd + (newText.length - oldText.length)).coerceIn(0, newText.length)
+        val selection = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, target)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, target)
+        }
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selection)
     }
 
     private fun isIdle(): Boolean = System.currentTimeMillis() - lastChangeAt >= IDLE_GATE_MS

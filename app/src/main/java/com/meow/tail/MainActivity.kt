@@ -9,6 +9,8 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.Editable
 import android.text.SpannableString
@@ -38,6 +40,8 @@ class MainActivity : Activity() {
     private lateinit var statusDot: View
     private lateinit var previewText: TextView
     private lateinit var diagText: TextView
+    private lateinit var statsText: TextView
+    private val uiHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -66,6 +70,7 @@ class MainActivity : Activity() {
         statusDot = findViewById(R.id.statusDot)
         previewText = findViewById(R.id.preview)
         diagText = findViewById(R.id.diag)
+        statsText = findViewById(R.id.stats)
 
         suffixEdit.setText(prefs.getString(TailService.KEY_SUFFIX, TailService.DEFAULT_SUFFIX))
         triggersEdit.setText(prefs.getString(TailService.KEY_TRIGGERS, TailService.DEFAULT_TRIGGERS))
@@ -98,6 +103,20 @@ class MainActivity : Activity() {
         super.onResume()
         updateStatus()
         renderLog()
+        uiHandler.postDelayed(refresher, 1200)
+    }
+
+    override fun onPause() {
+        uiHandler.removeCallbacks(refresher)
+        super.onPause()
+    }
+
+    private val refresher = object : Runnable {
+        override fun run() {
+            renderLog()
+            updateStatus()
+            uiHandler.postDelayed(this, 1200)
+        }
     }
 
     private fun save() {
@@ -142,6 +161,7 @@ class MainActivity : Activity() {
     }
 
     private fun renderLog() {
+        statsText.text = TailService.stats()
         val lines = TailService.snapshotLog()
         diagText.text = if (lines.isEmpty()) {
             "（暂无记录）\n打开无障碍后，去微信里打一句话，再回来看这里。"

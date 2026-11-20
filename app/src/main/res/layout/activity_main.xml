@@ -279,9 +279,18 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="正常工作时这里会记录最近 40 条事件与决策。打一句话再回来，就知道服务有没有收到事件。"
+                android:text="正常工作时这里会记录最近 40 条事件与决策。默认只对微信/QQ/TIM 生效；测试其它 App 请先勾选「所有应用都生效」。"
                 android:textColor="@color/muted"
                 android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/stats"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="@color/accent"
+                android:textSize="12sp"
+                android:textStyle="bold" />
 
             <TextView
                 android:id="@+id/diag"
