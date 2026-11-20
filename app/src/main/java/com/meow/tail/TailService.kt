@@ -12,15 +12,15 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * v1.1
+ * v1.2
  *
- * 相比 v1.0 的改动：
- * 1. 双通道检测：无障碍事件 + 400ms 轮询焦点输入框，谁先看到谁处理
- *    （微信/QQ 等 App 不一定广播文本变化事件，轮询是兜底）
- * 2. 触发点改为「最后一个句末标点」，并且判断该标点前后是否已经带后缀，
- *    避免「你好喵。今天」这种已经补过的句子被重复插入
- * 3. 内置诊断日志：最近 40 条事件/决策，可在 App 里查看并复制
- * 4. 自己写回后 400ms 内不再处理，避免自激
+ * 相对 v1.1 的变化：
+ * 1. 新增「无条件补喵」模式（默认开启）：不依赖句末标点，任何输入都会带上后缀
+ * 2. 归位逻辑：停顿 650ms 后，把后缀移到「最后一个标点之前」或「整句末尾」
+ *    - 用户继续打字时，后缀会被移到新内容的后面
+ *    - 已经带后缀的句子不会重复插入
+ * 3. 只在光标位于末尾时动手，避免打乱句中编辑
+ * 4. 保留诊断日志
  */
 class TailService : AccessibilityService() {
 
@@ -31,6 +31,7 @@ class TailService : AccessibilityService() {
         const val KEY_TRIGGERS = "triggers"
         const val KEY_ALL_APPS = "all_apps"
         const val KEY_PKGS = "pkg_list"
+        const val KEY_ALWAYS = "always_suffix"
 
         const val DEFAULT_SUFFIX = "喵"
         const val DEFAULT_TRIGGERS = "。！？!?～"
@@ -38,6 +39,8 @@ class TailService : AccessibilityService() {
 
         private const val MAX_LOG = 40
         private const val POLL_INTERVAL_MS = 400L
+        private const val SETTLE_DELAY_MS = 650L
+        private const val IDLE_GATE_MS = 500L
         private const val SELF_WRITE_WINDOW_MS = 400L
 
         private val logLines = ArrayDeque<String>()
@@ -63,17 +66,27 @@ class TailService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val lastText = HashMap<String, String>()
+    private var lastChangeAt = 0L
     private var lastSelfWriteAt = 0L
     private var polling = false
 
     private val pollRunnable = object : Runnable {
         override fun run() {
             try {
-                checkFocused("轮询")
+                if (isIdle()) checkFocused("轮询")
             } catch (t: Throwable) {
                 addLog("轮询异常 ${t.javaClass.simpleName}")
             }
             handler.postDelayed(this, POLL_INTERVAL_MS)
+        }
+    }
+
+    private val settleRunnable = Runnable {
+        try {
+            if (isIdle()) checkFocused("归位")
+            else scheduleSettle()
+        } catch (t: Throwable) {
+            addLog("归位异常 ${t.javaClass.simpleName}")
         }
     }
 
@@ -99,25 +112,30 @@ class TailService : AccessibilityService() {
         if (pkg == packageName) return
         if (!isAllowed(pkg)) return
 
+        lastChangeAt = System.currentTimeMillis()
         addLog("事件 ${typeName(type)} $pkg")
-        val node = event.source
-        if (node != null && type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
-            handleNode(node, pkg, "事件")
-        } else {
-            checkFocused("事件")
+
+        if (type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+            val node = event.source ?: focusedNode() ?: return
+            handle(node, pkg, "事件", immediate = true)
         }
+        scheduleSettle()
     }
 
     private fun checkFocused(source: String) {
         if (System.currentTimeMillis() - lastSelfWriteAt < SELF_WRITE_WINDOW_MS) return
-        val root = rootInActiveWindow ?: return
-        val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return
+        val node = focusedNode() ?: return
         val pkg = node.packageName?.toString() ?: return
         if (!isAllowed(pkg)) return
-        handleNode(node, pkg, source)
+        handle(node, pkg, source, immediate = false)
     }
 
-    private fun handleNode(node: AccessibilityNodeInfo, pkg: String, source: String) {
+    private fun focusedNode(): AccessibilityNodeInfo? {
+        val root = rootInActiveWindow ?: return null
+        return root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+    }
+
+    private fun handle(node: AccessibilityNodeInfo, pkg: String, source: String, immediate: Boolean) {
         if (node.isPassword) return
 
         val suffix = prefs().getString(KEY_SUFFIX, DEFAULT_SUFFIX).orEmpty()
@@ -131,29 +149,55 @@ class TailService : AccessibilityService() {
         lastText[pkg] = text
         if (previous == text) return
 
-        // 只看最后一个句末标点
-        var index = -1
-        for (i in text.length - 1 downTo 0) {
-            if (triggers.indexOf(text[i]) >= 0) {
-                index = i
-                break
-            }
-        }
-        if (index < 0) return
-
-        // 已经补过：标点前面是后缀，或者标点后面紧跟后缀
-        val alreadyDone = (index > 0 && text.substring(0, index).endsWith(suffix)) ||
-            (index + 1 < text.length && text.startsWith(suffix, index + 1))
-        if (alreadyDone) return
-
-        val head = text.substring(0, index)
-        if (head.isBlank()) return
-
-        val insertAt = index + 1
-        val newText = text.substring(0, insertAt) + suffix + text.substring(insertAt)
-        val selectionStart = node.textSelectionStart
+        // 用户正在句中编辑时不动，避免打乱光标
         val selectionEnd = node.textSelectionEnd
+        if (selectionEnd >= 0 && selectionEnd != text.length) return
 
+        val always = prefs().getBoolean(KEY_ALWAYS, true)
+        // 立即路径只处理「标点刚敲下」，其余交给停顿后的归位
+        if (immediate && triggers.indexOf(text.last()) < 0) return
+
+        val newText = normalize(text, suffix, triggers, always) ?: return
+        if (previous == newText) return
+
+        if (writeText(node, text, newText)) {
+            lastText[pkg] = newText
+            addLog("补字成功 [$source] $pkg «${tail(newText)}»")
+        } else {
+            addLog("写入失败 [$source] $pkg")
+        }
+    }
+
+    /**
+     * 把文本整理成「内容 + 后缀 + 末尾标点」。
+     * 返回 null 表示不需要改动。
+     */
+    private fun normalize(text: String, suffix: String, triggers: String, always: Boolean): String? {
+        if (text.isEmpty()) return null
+
+        var end = text.length
+        var punctuation: Char? = null
+        val lastChar = text[end - 1]
+        if (triggers.indexOf(lastChar) >= 0) {
+            punctuation = lastChar
+            end -= 1
+        }
+
+        var core = text.substring(0, end)
+        if (!always && punctuation == null) return null
+
+        // 去掉已经存在的后缀（最后一次出现），无论它被挤到哪
+        val index = core.lastIndexOf(suffix)
+        if (index >= 0) {
+            core = core.removeRange(index, index + suffix.length)
+        }
+        if (core.isBlank()) return null
+
+        val proposed = core + suffix + (punctuation?.toString() ?: "")
+        return if (proposed == text) null else proposed
+    }
+
+    private fun writeText(node: AccessibilityNodeInfo, oldText: String, newText: String): Boolean {
         lastSelfWriteAt = System.currentTimeMillis()
         val args = Bundle().apply {
             putCharSequence(
@@ -161,24 +205,25 @@ class TailService : AccessibilityService() {
                 newText,
             )
         }
-        val ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        if (!ok) {
-            addLog("写入失败 [$source] $pkg")
-            return
-        }
+        if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return false
 
-        if (selectionStart >= 0 && selectionEnd >= 0) {
-            val start = if (selectionStart >= insertAt) selectionStart + suffix.length else selectionStart
-            val end = if (selectionEnd >= insertAt) selectionEnd + suffix.length else selectionEnd
+        val selectionEnd = node.textSelectionEnd
+        if (selectionEnd >= 0) {
+            val target = selectionEnd + (newText.length - oldText.length)
             val selection = Bundle().apply {
-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, start)
-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, end)
+                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, target)
+                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, target)
             }
             node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selection)
         }
+        return true
+    }
 
-        lastText[pkg] = newText
-        addLog("补字成功 [$source] $pkg «${tail(text)}»")
+    private fun isIdle(): Boolean = System.currentTimeMillis() - lastChangeAt >= IDLE_GATE_MS
+
+    private fun scheduleSettle() {
+        handler.removeCallbacks(settleRunnable)
+        handler.postDelayed(settleRunnable, SETTLE_DELAY_MS)
     }
 
     private fun prefs(): SharedPreferences = getSharedPreferences(PREFS, MODE_PRIVATE)

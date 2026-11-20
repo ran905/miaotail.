@@ -33,6 +33,7 @@ class MainActivity : Activity() {
     private lateinit var pkgsEdit: EditText
     private lateinit var enabledSwitch: Switch
     private lateinit var allAppsCheck: CheckBox
+    private lateinit var alwaysCheck: CheckBox
     private lateinit var statusText: TextView
     private lateinit var statusDot: View
     private lateinit var previewText: TextView
@@ -60,6 +61,7 @@ class MainActivity : Activity() {
         pkgsEdit = findViewById(R.id.pkgs)
         enabledSwitch = findViewById(R.id.enabled)
         allAppsCheck = findViewById(R.id.allApps)
+        alwaysCheck = findViewById(R.id.alwaysSuffix)
         statusText = findViewById(R.id.status)
         statusDot = findViewById(R.id.statusDot)
         previewText = findViewById(R.id.preview)
@@ -70,6 +72,7 @@ class MainActivity : Activity() {
         pkgsEdit.setText(prefs.getString(TailService.KEY_PKGS, TailService.DEFAULT_PKGS))
         enabledSwitch.isChecked = prefs.getBoolean(TailService.KEY_ENABLED, true)
         allAppsCheck.isChecked = prefs.getBoolean(TailService.KEY_ALL_APPS, false)
+        alwaysCheck.isChecked = prefs.getBoolean(TailService.KEY_ALWAYS, true)
 
         suffixEdit.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -104,6 +107,7 @@ class MainActivity : Activity() {
             .putString(TailService.KEY_PKGS, pkgsEdit.text.toString())
             .putBoolean(TailService.KEY_ENABLED, enabledSwitch.isChecked)
             .putBoolean(TailService.KEY_ALL_APPS, allAppsCheck.isChecked)
+            .putBoolean(TailService.KEY_ALWAYS, alwaysCheck.isChecked)
             .apply()
 
         (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)

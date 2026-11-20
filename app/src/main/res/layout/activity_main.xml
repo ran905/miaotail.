@@ -142,6 +142,16 @@
                 android:textColor="@color/text"
                 android:textSize="16sp" />
 
+            <CheckBox
+                android:id="@+id/alwaysSuffix"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:checked="true"
+                android:text="无条件加：不需要句末标点，停下来就补"
+                android:textColor="@color/text"
+                android:textSize="14sp" />
+
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
