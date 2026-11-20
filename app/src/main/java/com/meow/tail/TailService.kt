@@ -14,6 +14,14 @@ import java.util.Date
 import java.util.Locale
 
 /**
+ * v1.7
+ *
+ * 针对「尝试很多、成功极少」：
+ * 1. 写之前先 refresh 节点；失效就重新找，避免在过期节点上 performAction
+ * 2. 找节点时优先选「包名与事件来源一致」的那一个，避免抓到百度输入法
+ *    自己窗口里的可编辑控件
+ * 3. 写失败后 1.5 秒内不重试，避免轮询把「尝试」刷成几百次
+ *
  * v1.6
  *
  * 针对荣耀 + 百度输入法：
@@ -104,6 +112,7 @@ class TailService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val lastSeen = HashMap<String, String>()
+    private val lastFailAt = HashMap<String, Long>()
     private var cachedCandidate: AccessibilityNodeInfo? = null
     private var lastChangeAt = 0L
     private var lastSelfWriteAt = 0L
@@ -158,7 +167,7 @@ class TailService : AccessibilityService() {
             addLog("事件 ${typeName(type)} $pkg [${className(source)}]")
 
             if (type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
-                val node = resolveCandidate(source) ?: findCandidateInAnyWindow()
+                val node = resolveCandidate(source) ?: findCandidateInAnyWindow(pkg)
                 if (node != null) {
                     cachedCandidate = node
                     val fromEvent = event.text?.joinToString("")?.takeIf { it.isNotEmpty() }
@@ -177,9 +186,17 @@ class TailService : AccessibilityService() {
         if (System.currentTimeMillis() - lastSelfWriteAt < SELF_WRITE_WINDOW_MS) return
         try {
             val cached = cachedCandidate
+            val cachedPkg = try {
+                cached?.packageName?.toString()
+            } catch (t: Throwable) {
+                null
+            }
             val node = when {
-                cached != null && safeIsCandidate(cached) -> cached
-                else -> focusedNode() ?: findCandidateInAnyWindow()
+                cached != null && safeIsCandidate(cached) &&
+                    cachedPkg != null && isAllowed(cachedPkg) -> cached
+                else -> focusedNode()?.takeIf { n ->
+                    runCatching { n.packageName?.toString()?.let { isAllowed(it) } == true }.getOrDefault(false)
+                } ?: findCandidateInAnyWindow()
             }
             if (node == null) {
                 addLog("跳过：$source 没找到输入框")
@@ -242,14 +259,25 @@ class TailService : AccessibilityService() {
             return
         }
 
+        val now = System.currentTimeMillis()
+        if (now - (lastFailAt[pkg] ?: 0L) < 1500L) return
+
         countAttempt()
-        if (writeText(node, text, newText)) {
+        val target = refreshOrFind(node, pkg)
+        if (target == null) {
+            countFail()
+            lastFailAt[pkg] = now
+            addLog("写入失败 [$source] 节点已失效且未找到替代")
+            return
+        }
+        if (writeText(target, text, newText)) {
             lastSeen[pkg] = newText
             countOk()
             addLog("补字成功 [$source] $pkg «${tail(newText)}»")
         } else {
             countFail()
-            addLog("写入失败 [$source] ${className(node)}")
+            lastFailAt[pkg] = now
+            addLog("写入失败 [$source] ${className(target)}")
         }
     }
 
@@ -279,6 +307,11 @@ class TailService : AccessibilityService() {
 
     private fun writeText(node: AccessibilityNodeInfo, oldText: String, newText: String): Boolean {
         lastSelfWriteAt = System.currentTimeMillis()
+        try {
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        } catch (t: Throwable) {
+            // 拿不到焦点也继续尝试写入
+        }
         val args = Bundle().apply {
             putCharSequence(
                 AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
@@ -359,8 +392,18 @@ class TailService : AccessibilityService() {
         return null
     }
 
+    /** 节点可能已过期：先 refresh，失败就重新找同包名的输入框。 */
+    private fun refreshOrFind(node: AccessibilityNodeInfo, pkg: String): AccessibilityNodeInfo? {
+        try {
+            if (node.refresh()) return node
+        } catch (t: Throwable) {
+            // 掉到重新查找
+        }
+        return findCandidateInAnyWindow(pkg)
+    }
+
     /** 跨窗口搜索：输入法窗口可能抢走「当前活动窗口」。 */
-    private fun findCandidateInAnyWindow(): AccessibilityNodeInfo? {
+    private fun findCandidateInAnyWindow(preferredPkg: String? = null): AccessibilityNodeInfo? {
         val roots = mutableListOf<AccessibilityNodeInfo>()
         try {
             windows.forEach { w ->
@@ -379,7 +422,12 @@ class TailService : AccessibilityService() {
             // 忽略
         }
 
+        var allowedFocused: AccessibilityNodeInfo? = null
+        var allowed: AccessibilityNodeInfo? = null
+        var samePackage: AccessibilityNodeInfo? = null
+        var focused: AccessibilityNodeInfo? = null
         var fallback: AccessibilityNodeInfo? = null
+
         for (root in roots) {
             val queue = ArrayDeque<AccessibilityNodeInfo>()
             queue.add(root)
@@ -389,7 +437,17 @@ class TailService : AccessibilityService() {
                 val node = queue.removeFirst()
                 try {
                     if (isCandidate(node)) {
-                        if (node.isFocused) return node
+                        val nodePkg = node.packageName?.toString()
+                        val pkgAllowed = nodePkg != null && isAllowed(nodePkg)
+                        if (preferredPkg != null && nodePkg == preferredPkg) {
+                            if (node.isFocused) return node
+                            if (samePackage == null) samePackage = node
+                        }
+                        if (pkgAllowed) {
+                            if (node.isFocused && allowedFocused == null) allowedFocused = node
+                            if (allowed == null) allowed = node
+                        }
+                        if (focused == null && node.isFocused) focused = node
                         if (fallback == null) fallback = node
                     }
                     for (i in 0 until node.childCount) {
@@ -400,7 +458,7 @@ class TailService : AccessibilityService() {
                 }
             }
         }
-        return fallback
+        return samePackage ?: allowedFocused ?: allowed ?: focused ?: fallback
     }
 
     private fun isIdle(): Boolean = System.currentTimeMillis() - lastChangeAt >= IDLE_GATE_MS
