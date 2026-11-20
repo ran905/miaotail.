@@ -8,6 +8,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -89,6 +90,9 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.openSettings).setOnClickListener {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
+        findViewById<Button>(R.id.openAppSettings).setOnClickListener {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+        }
         findViewById<Button>(R.id.copyLog).setOnClickListener { copyLog() }
         findViewById<Button>(R.id.clearLog).setOnClickListener {
             TailService.clearLog()
@@ -132,6 +136,7 @@ class MainActivity : Activity() {
         (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)
             ?.hideSoftInputFromWindow(suffixEdit.windowToken, 0)
 
+        TailService.reapplyRequested = true
         updateStatus()
         updatePreview()
         Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()

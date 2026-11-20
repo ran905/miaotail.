@@ -9,4 +9,7 @@
     <string name="consent_title">先看一眼</string>
     <string name="consent_message">这个 App 会在你打字时，自动在句末标点前插入一个后缀（默认「喵」）。\n\n它不联网、不上传、不保存聊天内容，所有设置只存在本机。\n\n把它装到别人手机上之前，请确认对方知情并同意。安装后随时可以在系统设置里关闭无障碍权限，或者直接卸载。</string>
     <string name="consent_ok">我知道了</string>
+    <string name="guide_title">保活设置（重要）</string>
+    <string name="guide_body">很多国产系统会限制后台运行，导致无障碍服务被"冻结"，表现为：能收到事件、但读不到界面，或者用一会儿就失效。请到应用信息里把下面三项全部允许：\n\n1. 自启动\n2. 关联启动\n3. 后台运行 / 耗电管理 → 允许后台活动\n\n荣耀：设置 → 应用 → 应用启动管理 → 喵尾巴 → 全部允许</string>
+    <string name="guide_button">打开应用信息</string>
 </resources>

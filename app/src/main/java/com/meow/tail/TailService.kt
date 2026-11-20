@@ -1,6 +1,8 @@
 package com.meow.tail
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.graphics.Rect
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.SharedPreferences
@@ -59,6 +61,9 @@ class TailService : AccessibilityService() {
 
         private var lastLogKey = ""
         private var lastLogAt = 0L
+
+        @Volatile
+        var reapplyRequested = false
 
         private var eventCount = 0
         private var writeAttempts = 0
@@ -120,6 +125,7 @@ class TailService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private val lastSeen = HashMap<String, String>()
     private val lastFailAt = HashMap<String, Long>()
+    private val learnedIds = HashMap<String, MutableSet<String>>()
     private var cachedCandidate: AccessibilityNodeInfo? = null
     private var lastChangeAt = 0L
     private var lastSelfWriteAt = 0L
@@ -128,6 +134,10 @@ class TailService : AccessibilityService() {
     private val pollRunnable = object : Runnable {
         override fun run() {
             try {
+                if (reapplyRequested) {
+                    reapplyRequested = false
+                    applyServiceInfo()
+                }
                 if (isIdle()) checkFocused("轮询", Mode.POLL)
             } catch (t: Throwable) {
                 addLog("轮询异常 ${t.javaClass.simpleName}")
@@ -147,10 +157,50 @@ class TailService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         addLog("服务已连接")
+        applyServiceInfo()
         if (!polling) {
             polling = true
             handler.postDelayed(pollRunnable, POLL_INTERVAL_MS)
         }
+    }
+
+    /**
+     * 运行时重新下发服务配置。
+     * Honor 等 ROM 上，XML 里声明的 flags（尤其是窗口读取）有时不生效，
+     * 只有 setServiceInfo() 重新下发的配置才被系统采纳。
+     */
+    private fun applyServiceInfo() {
+        val info = try {
+            serviceInfo
+        } catch (t: Throwable) {
+            null
+        } ?: return
+        try {
+            info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_FOCUSED or
+                AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED
+            info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+            info.notificationTimeout = 0
+            info.flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+            val p = prefs()
+            info.packageNames = if (p.getBoolean(KEY_ALL_APPS, false)) {
+                null
+            } else {
+                p.getString(KEY_PKGS, DEFAULT_PKGS).orEmpty()
+                    .split(',').map { it.trim() }.filter { it.isNotEmpty() }.toTypedArray()
+            }
+            setServiceInfo(info)
+            addLog("配置已下发：包=${info.packageNames?.joinToString(",") ?: "全部"} 窗口读取=${(info.flags and AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS) != 0}")
+        } catch (t: Throwable) {
+            addLog("配置下发失败 ${t.javaClass.simpleName}")
+        }
+        // 配置变化后立刻清掉旧缓存，避免继续用旧节点
+        cachedCandidate = null
+        lastSeen.clear()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -174,7 +224,7 @@ class TailService : AccessibilityService() {
             addLog("事件 ${typeName(type)} $pkg [${className(source)}]")
 
             if (type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
-                val node = resolveCandidate(source) ?: findCandidateInAnyWindow(pkg)
+                val node = resolveCandidate(source) ?: findComposer(pkg) ?: findCandidateInAnyWindow(pkg)
                 if (node != null) {
                     cachedCandidate = node
                     val fromEvent = event.text?.joinToString("")?.takeIf { it.isNotEmpty() }
@@ -203,7 +253,7 @@ class TailService : AccessibilityService() {
                     cachedPkg != null && isAllowed(cachedPkg) -> cached
                 else -> focusedNode()?.takeIf { n ->
                     runCatching { n.packageName?.toString()?.let { isAllowed(it) } == true }.getOrDefault(false)
-                } ?: findCandidateInAnyWindow()
+                } ?: findComposer(null) ?: findCandidateInAnyWindow()
             }
             if (node == null) {
                 addLog("跳过：$source 没找到输入框 | ${dumpTree()}")
@@ -271,7 +321,9 @@ class TailService : AccessibilityService() {
         val now = System.currentTimeMillis()
         if (now - (lastFailAt[pkg] ?: 0L) < 1500L) return
 
+        // MoeText 式重试：40 / 80 / 120 ms 三次，最多到 800ms
         countAttempt()
+        scheduleRetry(pkg, text, retryIndex = 0)
         val target = refreshOrFind(node, pkg)
         if (target == null) {
             countFail()
@@ -409,6 +461,107 @@ class TailService : AccessibilityService() {
             // 掉到重新查找
         }
         return findCandidateInAnyWindow(pkg)
+    }
+
+    /** 已知的聊天输入框资源 ID（参考 MoeText 的适配方式）。 */
+    private fun knownIdsFor(pkg: String?): List<String> {
+        val ids = when (pkg) {
+            "com.tencent.mobileqq" -> listOf("com.tencent.mobileqq:id/input")
+            "com.tencent.tim" -> listOf("com.tencent.tim:id/input")
+            else -> emptyList()
+        }
+        return ids + learnedIds[pkg].orEmpty().map { "$pkg:id/$it" }
+    }
+
+    /**
+     * 按「资源 ID → 布局兜底」定位聊天输入框：
+     * - 先按已知 viewId 查找
+     * - 再找窗口下部（≥45% 高度）的多行 EditText，排除搜索框
+     */
+    private fun findComposer(pkg: String?): AccessibilityNodeInfo? {
+        val roots = mutableListOf<Pair<AccessibilityNodeInfo, Rect>>()
+        try {
+            windows.forEach { w ->
+                try {
+                    val root = w.root ?: return@forEach
+                    val bounds = Rect()
+                    w.getBoundsInScreen(bounds)
+                    roots.add(root to bounds)
+                } catch (t: Throwable) {
+                    // 忽略
+                }
+            }
+        } catch (t: Throwable) {
+            // windows 不可用
+        }
+        if (roots.isEmpty()) {
+            try {
+                rootInActiveWindow?.let { roots.add(it to Rect(0, 0, 0, 0)) }
+            } catch (t: Throwable) {
+                // 忽略
+            }
+        }
+
+        val packages = if (pkg != null) listOf(pkg) else prefs().getString(KEY_PKGS, DEFAULT_PKGS)
+            .orEmpty().split(',').map { it.trim() }.filter { it.isNotEmpty() }
+
+        for (p in packages) {
+            for (id in knownIdsFor(p)) {
+                for ((root, _) in roots) {
+                    try {
+                        val found = root.findAccessibilityNodeInfosByViewId(id)
+                        if (!found.isNullOrEmpty()) {
+                            val node = found.first()
+                            if (node != null) {
+                                addLog("按ID命中 $id")
+                                return node
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        // 忽略
+                    }
+                }
+            }
+        }
+
+        var fallback: AccessibilityNodeInfo? = null
+        for ((root, windowBounds) in roots) {
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+            var visited = 0
+            while (queue.isNotEmpty() && visited < 600) {
+                visited++
+                val node = queue.removeFirst()
+                try {
+                    val cls = node.className?.toString().orEmpty()
+                    if (cls.contains("EditText", ignoreCase = true) && !node.isPassword) {
+                        val hint = if (android.os.Build.VERSION.SDK_INT >= 26) {
+                            node.hintText?.toString().orEmpty()
+                        } else {
+                            ""
+                        }
+                        val text = node.text?.toString().orEmpty()
+                        val label = (hint + " " + text).lowercase()
+                        if (!label.contains("搜索") && !label.contains("search")) {
+                            val bounds = Rect()
+                            node.getBoundsInScreen(bounds)
+                            val height = windowBounds.height()
+                            val lowerHalf = height <= 0 || (bounds.top - windowBounds.top) >= height * 0.45f
+                            if (lowerHalf) {
+                                if (node.isFocused) return node
+                                if (fallback == null) fallback = node
+                            }
+                        }
+                    }
+                    for (i in 0 until node.childCount) {
+                        node.getChild(i)?.let { queue.add(it) }
+                    }
+                } catch (t: Throwable) {
+                    // 忽略失效节点
+                }
+            }
+        }
+        return fallback
     }
 
     /** 跨窗口搜索：输入法窗口可能抢走「当前活动窗口」。 */
@@ -554,6 +707,23 @@ class TailService : AccessibilityService() {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .any { it == pkg }
+    }
+
+    private fun scheduleRetry(pkg: String, expected: String, retryIndex: Int) {
+        val delays = intArrayOf(40, 80, 120, 300)
+        if (retryIndex >= delays.size) return
+        handler.postDelayed({
+            try {
+                val p = prefs()
+                if (!p.getBoolean(KEY_ENABLED, true)) return@postDelayed
+                val composer = findComposer(pkg)
+                if (composer != null) {
+                    handle(composer, pkg, "重试${delays[retryIndex]}", Mode.SETTLE, null)
+                }
+            } catch (t: Throwable) {
+                // 忽略
+            }
+        }, delays[retryIndex].toLong())
     }
 
     private fun viewId(node: AccessibilityNodeInfo?): String =
