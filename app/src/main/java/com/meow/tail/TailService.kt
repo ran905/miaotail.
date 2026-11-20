@@ -180,7 +180,7 @@ class TailService : AccessibilityService() {
                     val fromEvent = event.text?.joinToString("")?.takeIf { it.isNotEmpty() }
                     handle(node, pkg, "事件", Mode.EVENT, fromEvent)
                 } else {
-                    addLog("跳过：没找到输入框 $pkg")
+                    addLog("跳过：没找到输入框 $pkg | ${dumpTree()}")
                 }
             }
             scheduleSettle()
@@ -206,7 +206,7 @@ class TailService : AccessibilityService() {
                 } ?: findCandidateInAnyWindow()
             }
             if (node == null) {
-                addLog("跳过：$source 没找到输入框")
+                addLog("跳过：$source 没找到输入框 | ${dumpTree()}")
                 return
             }
             cachedCandidate = node
@@ -472,6 +472,68 @@ class TailService : AccessibilityService() {
         return samePackage ?: allowedFocused ?: allowed ?: focused ?: fallback
     }
 
+    /** 把当前窗口里「有文本或像输入框」的节点摘出来，用于取证。 */
+    private fun dumpTree(): String {
+        val sb = StringBuilder()
+        try {
+            val roots = mutableListOf<AccessibilityNodeInfo>()
+            try {
+                windows.forEach { w ->
+                    try {
+                        w.root?.let { roots.add(it) }
+                    } catch (t: Throwable) {
+                        // 忽略
+                    }
+                }
+            } catch (t: Throwable) {
+                // windows 不可用
+            }
+            if (roots.isEmpty()) {
+                try {
+                    rootInActiveWindow?.let { roots.add(it) }
+                } catch (t: Throwable) {
+                    // 忽略
+                }
+            }
+            sb.append("窗口数 ").append(roots.size)
+            for ((wi, root) in roots.withIndex()) {
+                val childCount = try {
+                    root.childCount
+                } catch (t: Throwable) {
+                    -1
+                }
+                sb.append(" | w").append(wi).append(':').append(className(root)).append('/').append(childCount)
+                val queue = ArrayDeque<AccessibilityNodeInfo>()
+                queue.add(root)
+                var visited = 0
+                while (queue.isNotEmpty() && visited < 14) {
+                    visited++
+                    val node = queue.removeFirst()
+                    val t = try {
+                        node.text?.toString().orEmpty()
+                    } catch (e: Throwable) {
+                        ""
+                    }
+                    if (t.isNotEmpty() || safeIsCandidate(node)) {
+                        sb.append(" <").append(className(node))
+                        if (t.isNotEmpty()) sb.append(" «").append(t.take(8)).append("»")
+                        sb.append('>')
+                    }
+                    try {
+                        for (i in 0 until node.childCount) {
+                            node.getChild(i)?.let { queue.add(it) }
+                        }
+                    } catch (e: Throwable) {
+                        // 忽略失效节点
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            sb.append("dump异常")
+        }
+        return sb.toString()
+    }
+
     private fun isIdle(): Boolean = System.currentTimeMillis() - lastChangeAt >= IDLE_GATE_MS
 
     private fun scheduleSettle() {
@@ -482,6 +544,7 @@ class TailService : AccessibilityService() {
     private fun prefs(): SharedPreferences = getSharedPreferences(PREFS, MODE_PRIVATE)
 
     private fun isAllowed(pkg: String): Boolean {
+        if (pkg == packageName) return false
         val p = prefs()
         if (!p.getBoolean(KEY_ENABLED, true)) return false
         if (p.getBoolean(KEY_ALL_APPS, false)) return true
