@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="220" viewBox="0 0 720 220" font-family="-apple-system, 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif">
+  <rect width="720" height="220" rx="24" fill="#FFF7EF"/>
+
+  <text x="48" y="52" fill="#8C7A6B" font-size="14" font-weight="bold" letter-spacing="2">开启前</text>
+  <rect x="48" y="68" width="300" height="58" rx="18" fill="#FFFFFF" stroke="#F0E2D3"/>
+  <text x="72" y="105" fill="#2A2018" font-size="21">今天天气不错。</text>
+
+  <text x="392" y="140" fill="#8C7A6B" font-size="14" font-weight="bold" letter-spacing="2">开启后</text>
+  <rect x="392" y="156" width="300" height="58" rx="18" fill="#FF7A59"/>
+  <text x="416" y="193" fill="#FFFFFF" font-size="21">今天天气不错<tspan fill="#FFE3D9" font-weight="bold">喵</tspan>。</text>
+</svg>

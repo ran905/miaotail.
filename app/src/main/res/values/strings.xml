@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">喵尾巴</string>
+    <string name="service_label">喵尾巴 · 句尾补字</string>
+    <string name="service_desc">在每句话的句末自动补上你设置的后缀（默认「喵」）。只在本机改写输入框里的文字，不联网、不上传、不记录。</string>
+    <string name="hint_suffix">后缀（例如：喵）</string>
+    <string name="hint_triggers">触发标点（例如：。！？!?～）</string>
+    <string name="hint_pkgs">仅这些应用生效（包名，逗号分隔）</string>
+    <string name="consent_title">先看一眼</string>
+    <string name="consent_message">这个 App 会在你打字时，自动在句末标点前插入一个后缀（默认「喵」）。\n\n它不联网、不上传、不保存聊天内容，所有设置只存在本机。\n\n把它装到别人手机上之前，请确认对方知情并同意。安装后随时可以在系统设置里关闭无障碍权限，或者直接卸载。</string>
+    <string name="consent_ok">我知道了</string>
+</resources>
