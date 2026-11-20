@@ -11,13 +11,33 @@ android {
         applicationId = "com.meow.tail"
         minSdk = 24
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
+    }
+
+    signingConfigs {
+        create("shared") {
+            val path = System.getenv("KEYSTORE_FILE")
+            if (!path.isNullOrBlank()) {
+                storeFile = file(path)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
-        release {
+        getByName("debug") {
+            if (!System.getenv("KEYSTORE_FILE").isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("shared")
+            }
+        }
+        getByName("release") {
             isMinifyEnabled = false
+            if (!System.getenv("KEYSTORE_FILE").isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("shared")
+            }
         }
     }
 

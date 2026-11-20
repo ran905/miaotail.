@@ -32,7 +32,17 @@ jobs:
         with:
           gradle-version: "8.7"
 
+      - name: Decode signing key
+        run: |
+          printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/miaotail.p12"
+          ls -l "$RUNNER_TEMP/miaotail.p12"
+
       - name: Build debug APK
+        env:
+          KEYSTORE_FILE: ${{ runner.temp }}/miaotail.p12
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
