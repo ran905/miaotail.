@@ -101,7 +101,7 @@ A：可以，App 里直接改后缀。改代码也欢迎，见下方编译说明
 
 **命令行**：JDK 17 + Gradle 8.7+，执行 `gradle assembleDebug`。
 
-**云端**：仓库内置两个 GitHub Actions 工作流。推代码即自动编译（`build-apk.yml`）；只上传了 `miaotail.zip` 时，手动跑 `build-from-zip.yml`。产物在运行记录的 Artifacts 里。
+**云端**：仓库内置 GitHub Actions 工作流（`.github/workflows/build.yml`）。推代码即自动编译，也可以在 Actions 页面手动 Run workflow。产物在运行记录的 Artifacts 里，同时会发布到 Releases。
 
 ## 使用前提与免责声明
 
