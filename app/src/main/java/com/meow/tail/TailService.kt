@@ -45,6 +45,8 @@ class TailService : AccessibilityService() {
         const val KEY_ALL_APPS = "all_apps"
         const val KEY_PKGS = "pkg_list"
         const val KEY_ALWAYS = "always_suffix"
+        const val KEY_EXCLUDE = "exclude_list"
+        const val DEFAULT_EXCLUDE = "com.meow.tail,dsh.android.client"
 
         const val DEFAULT_SUFFIX = "喵"
         const val DEFAULT_TRIGGERS = "。！？!?～"
@@ -217,7 +219,9 @@ class TailService : AccessibilityService() {
             if (pkg == packageName) return
             if (!isAllowed(pkg)) return
 
-            lastChangeAt = System.currentTimeMillis()
+            if (type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+                lastChangeAt = System.currentTimeMillis()
+            }
             countEvent()
 
             val source = event.source
@@ -699,6 +703,9 @@ class TailService : AccessibilityService() {
     private fun isAllowed(pkg: String): Boolean {
         if (pkg == packageName) return false
         val p = prefs()
+        val excluded = p.getString(KEY_EXCLUDE, DEFAULT_EXCLUDE).orEmpty()
+            .split(',').map { it.trim() }.filter { it.isNotEmpty() }
+        if (pkg in excluded) return false
         if (!p.getBoolean(KEY_ENABLED, true)) return false
         if (p.getBoolean(KEY_ALL_APPS, false)) return true
         val list = p.getString(KEY_PKGS, DEFAULT_PKGS).orEmpty()
